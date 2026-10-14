@@ -1,0 +1,21 @@
+# Phase server on Cloudflare Workers (free plan): accounts, sync and push notifications.
+# The app itself stays on Vercel; vercel.json forwards /api/* to this Worker.
+# Step-by-step setup: docs/DEPLOY.md
+name = "phase-api"
+main = "server/worker.ts"
+compatibility_date = "2026-09-01"
+# Keep variables/secrets you set in the Cloudflare dashboard when redeploying.
+keep_vars = true
+
+# Check for notifications to send every minute.
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "phase"
+database_id = "PASTE_YOUR_DATABASE_ID_HERE"  # from Cloudflare dashboard → Storage & databases → D1 → phase
+
+[vars]
+# Maximum number of accounts. Change it here (or in the dashboard) any time.
+MAX_USERS = "25"

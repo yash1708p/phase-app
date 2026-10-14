@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="phase_widget_bg">#241A1C</color>
+    <color name="phase_widget_text">#FFF5F0</color>
+    <color name="phase_widget_muted">#BFAEB0</color>
+    <color name="phase_widget_rose">#F2798A</color>
+
+    <string name="phase_widget_description">Fatigue, sleep, water and stress at a glance.</string>
+    <string name="phase_widget_empty">Open Phase to start tracking fatigue, sleep, water and stress.</string>
+</resources>

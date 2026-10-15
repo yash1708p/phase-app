@@ -108,7 +108,7 @@ export default function AuthScreen() {
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
-            placeholder="e.g. maya"
+            placeholder="e.g. shash"
           />
         </label>
         <label className="block">

@@ -19,3 +19,6 @@ database_id = "aef9a205-de09-41ab-8c86-e412436eb79f"  # from Cloudflare dashboar
 [vars]
 # Maximum number of accounts. Change it here (or in the dashboard) any time.
 MAX_USERS = "25"
+
+[observability]
+enabled = true

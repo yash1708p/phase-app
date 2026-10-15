@@ -1,0 +1,291 @@
+import { describe, expect, it } from 'vitest';
+import { DEFAULT_NOTIFICATION_SETTINGS, displayName, nextNotificationLog, planNotifications, type PlanInput } from '../lib/notifications';
+import { numericId } from '../lib/notifier';
+import { getCycleStatus, predict } from '../lib/predictionEngine';
+import { cycleFindings, cycleHistory, cycleStats } from '../lib/analytics';
+import { addDays } from '../lib/dates';
+import { emptyData } from '../lib/storage';
+import { blankLog } from '../lib/store';
+import type { AppData, DailyLog, NotificationSettings } from '../types';
+
+const today = '2026-10-12';
+const span = (s: string, n: number) => Array.from({ length: n }, (_, i) => addDays(s, i));
+const t = (date: string, h: number, m = 0) => new Date(`${date}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00`).getTime();
+
+function input(data: AppData, now: number, day = today): PlanInput {
+  const prediction = predict({ profile: data.profile!, periodDays: data.periodDays, today: day });
+  const status = getCycleStatus(prediction, data.periodDays, day);
+  const history = cycleHistory(data.periodDays, data.logs, day);
+  return {
+    data,
+    now,
+    today: day,
+    prediction,
+    status,
+    stats: cycleStats(history, data.logs, day),
+    findings: cycleFindings({ profile: data.profile!, history, logs: data.logs, periodDays: data.periodDays, prediction, today: day }),
+  };
+}
+
+function make(opts: { periodStart: string; logs?: Record<string, DailyLog>; notif?: Partial<NotificationSettings>; username?: string; periodDays?: string[]; water?: boolean; wins?: boolean }): AppData {
+  return {
+    ...emptyData(),
+    username: opts.username ?? 'maya',
+    profile: { age: 29, primaryGoal: 'track_period', typicalCycleLength: 28, typicalPeriodLength: 5 },
+    periodDays: opts.periodDays ?? span(opts.periodStart, 5),
+    logs: opts.logs ?? {},
+    settings: {
+      lockEnabled: false,
+      tempUnit: 'C',
+      // Hourly water reminders and today's win are tested on their own; most tests leave them out.
+      notifications: { ...DEFAULT_NOTIFICATION_SETTINGS, enabled: true, categories: { ...DEFAULT_NOTIFICATION_SETTINGS.categories, water: !!opts.water, wins: !!opts.wins }, ...opts.notif },
+    },
+  };
+}
+
+const log = (date: string, sym: Partial<DailyLog['symptoms']> = {}, life: Partial<DailyLog['lifestyle']> = {}): DailyLog => ({
+  ...blankLog(date),
+  symptoms: { moods: [], ...sym },
+  lifestyle: { medications: [], ...life },
+});
+
+describe('notification planner', () => {
+  it('sends a comforting note soon after severe cramps are logged — discreetly by default', () => {
+    const data = make({ periodStart: '2026-09-20', logs: { [today]: log(today, { cramps: 'severe' }) } });
+    const now = t(today, 11);
+    const plan = planNotifications(input(data, now));
+    const c = plan.find((p) => p.key === `comfort/cramps:${today}`)!;
+    expect(c.at).toBe(now + 60_000);
+    expect(c.title).toBe('Sending you some care 💛');
+    expect(c.body).not.toMatch(/cramp|period/i);
+
+    const open = planNotifications(input(make({ periodStart: '2026-09-20', logs: data.logs, notif: { discreet: false } }), now));
+    expect(open.find((p) => p.key === `comfort/cramps:${today}`)!.title).toBe('Sorry today’s rough 💛');
+  });
+
+  it('schedules the period heads-up for 9 am two days before, naming the weekday', () => {
+    // Last period Sep 17 → next expected Oct 15 (Thursday).
+    const data = make({ periodStart: '2026-09-17', notif: { discreet: false } });
+    const plan = planNotifications(input(data, t(today, 7)));
+    const soon = plan.find((p) => p.key === 'cycle/period-soon:2026-10-15')!;
+    expect(soon.at).toBe(t('2026-10-13', 9));
+    expect(soon.body).toBe('Your period is expected around Thursday. Might be worth packing supplies.');
+    expect(plan.find((p) => p.key === 'cycle/period-today:2026-10-15')!.at).toBe(t('2026-10-15', 9));
+  });
+
+  it('keeps cycle wording off the lock screen in discreet mode', () => {
+    const plan = planNotifications(input(make({ periodStart: '2026-09-17' }), t(today, 7)));
+    for (const p of plan) expect(`${p.title} ${p.body}`).not.toMatch(/period|cramp|fertile|ovulat/i);
+  });
+
+  it('uses the user’s name, and skips odd usernames', () => {
+    expect(displayName('maya')).toBe('Maya');
+    expect(displayName('maya_92')).toBe('');
+    const data = make({ periodStart: '2026-09-20', logs: { [today]: log(today, {}, { stress: 'high' }) } });
+    expect(planNotifications(input(data, t(today, 11))).find((p) => p.key.startsWith('comfort/stress'))!.title).toBe('A heavy day, Maya');
+  });
+
+  it('limits to two a day plus one reminder, keeping the most important', () => {
+    const logs = { [today]: log(today, { cramps: 'severe', moods: ['sad'], headache: 'migraine' }, { stress: 'high', sleepHours: 5 }) };
+    const plan = planNotifications(input(make({ periodStart: '2026-09-20', logs }), t(today, 11)));
+    const todays = plan.filter((p) => new Date(p.at).toDateString() === new Date(t(today, 12)).toDateString());
+    const main = todays.filter((p) => p.category !== 'reminders');
+    expect(main).toHaveLength(2);
+    expect(main.map((p) => p.key).sort()).toEqual([`comfort/cramps:${today}`, `comfort/migraine:${today}`]);
+    expect(todays.filter((p) => p.category === 'reminders').length).toBeLessThanOrEqual(1);
+  });
+
+  it('counts notifications already sent today toward the limit and never repeats one', () => {
+    const logs = { [today]: log(today, { cramps: 'severe' }, { stress: 'high' }) };
+    const data = make({ periodStart: '2026-09-20', logs });
+    data.notificationLog = { [`comfort/cramps:${today}`]: t(today, 9), [`morning/sleep-good:${today}`]: t(today, 8, 30) };
+    const plan = planNotifications(input(data, t(today, 11)));
+    expect(plan.some((p) => p.key === `comfort/cramps:${today}`)).toBe(false);
+    expect(plan.some((p) => p.key === `comfort/stress:${today}`)).toBe(false); // daily limit already reached
+  });
+
+  it('respects quiet hours: comfort is dropped at night, cycle news waits until morning', () => {
+    const late = t(today, 22, 30);
+    const logs = { [today]: log(today, {}, { stress: 'high' }) };
+    const plan = planNotifications(input(make({ periodStart: '2026-09-20', logs }), late));
+    expect(plan.some((p) => p.key.startsWith('comfort/stress'))).toBe(false);
+    for (const p of plan) {
+      const h = new Date(p.at).getHours();
+      expect(h >= 8 && h < 21).toBe(true);
+    }
+  });
+
+  it('honours switched-off categories', () => {
+    const logs = { [today]: log(today, { cramps: 'severe' }) };
+    const plan = planNotifications(
+      input(make({ periodStart: '2026-09-20', logs, notif: { categories: { ...DEFAULT_NOTIFICATION_SETTINGS.categories, comfort: false } } }), t(today, 11)),
+    );
+    expect(plan.some((p) => p.category === 'comfort')).toBe(false);
+  });
+
+  it('celebrates the water goal and nudges at 3 pm when behind', () => {
+    const y = addDays(today, -1);
+    const done = make({ periodStart: '2026-09-20', logs: { [y]: log(y, {}, { waterGlasses: 6 }), [today]: log(today, {}, { waterGlasses: 9 }) } });
+    expect(planNotifications(input(done, t(today, 14))).find((p) => p.key.startsWith('motivation/water-goal'))!.body).toBe('9 glasses today. Nicely done, Maya!');
+    const behind = make({ periodStart: '2026-09-20', logs: { [y]: log(y, {}, { waterGlasses: 6 }), [today]: log(today, {}, { waterGlasses: 2 }) } });
+    const nudge = planNotifications(input(behind, t(today, 10))).find((p) => p.key.startsWith('motivation/water-nudge'))!;
+    expect(nudge.at).toBe(t(today, 15));
+    expect(nudge.body).toBe('You’re at 2 of 8 glasses. A glass now helps keep headaches away.');
+  });
+
+  it('reminds to log in the evening only on days with no log', () => {
+    const plan = planNotifications(input(make({ periodStart: '2026-09-20', logs: { [today]: log(today, {}, { sleepHours: 8 }) } }), t(today, 10)));
+    expect(plan.some((p) => p.key === `reminders/evening-log:${today}`)).toBe(false);
+    expect(plan.find((p) => p.key === `reminders/evening-log:${addDays(today, 1)}`)!.at).toBe(t(addDays(today, 1), 20));
+  });
+
+  it('sends day-1 comfort once a period is logged today', () => {
+    const data = make({ periodStart: today, periodDays: [...span('2026-09-14', 5), today] });
+    const plan = planNotifications(input(data, t(today, 9)));
+    expect(plan.some((p) => p.key === `cycle/day-one:${today}`)).toBe(true);
+  });
+
+  it('keeps a stable log: sent items stay, cancelled plans disappear', () => {
+    const now = t(today, 12);
+    const log1 = nextNotificationLog({ 'a/x:1': now - 1000, 'b/old:1': now - 90 * 86_400_000, 'c/future:1': now + 5000 }, [], now);
+    expect(log1).toEqual({ 'a/x:1': now - 1000 });
+  });
+
+  it('numeric ids are stable 31-bit integers', () => {
+    expect(numericId('comfort/cramps:2026-10-12')).toBe(numericId('comfort/cramps:2026-10-12'));
+    expect(numericId('x')).toBeLessThan(2 ** 31);
+    expect(numericId('a')).not.toBe(numericId('b'));
+  });
+
+  describe('hourly water reminders', () => {
+    const water = (p: ReturnType<typeof planNotifications>) => p.filter((n) => n.category === 'water');
+
+    it('sends one every hour outside quiet hours (9 pm–8 am by default), today and tomorrow', () => {
+      const plan = water(planNotifications(input(make({ periodStart: '2026-09-20', water: true }), t(today, 13, 30))));
+      const hours = (d: string) => plan.filter((n) => n.key.includes(d)).map((n) => new Date(n.at).getHours());
+      expect(hours(today)).toEqual([14, 15, 16, 17, 18, 19, 20]);
+      expect(hours(addDays(today, 1))).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+      expect(plan.every((n) => new Date(n.at).getMinutes() === 0)).toBe(true);
+    });
+
+    it('follows custom quiet hours', () => {
+      const plan = water(planNotifications(input(make({ periodStart: '2026-09-20', water: true, notif: { quietStart: 19, quietEnd: 10 } }), t(today, 6))));
+      const hours = plan.filter((n) => n.key.includes(today)).map((n) => new Date(n.at).getHours());
+      expect(hours).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18]);
+    });
+
+    it('keeps coming every hour however much is logged, with progress in the message', () => {
+      const now = t(today, 11, 10);
+      const at = (glasses: number) =>
+        water(planNotifications(input(make({ periodStart: '2026-09-20', water: true, logs: { [today]: log(today, {}, { waterGlasses: glasses }) } }), now))).filter((n) =>
+          n.key.includes(today),
+        );
+      // Adding glasses (or taking one back) never moves the reminders.
+      expect(at(3).map((n) => n.at)).toEqual(at(2).map((n) => n.at));
+      expect(new Date(at(3)[0].at).getHours()).toBe(12);
+      expect(at(3)[0].body).toMatch(/^You’re at 3 of 8 glasses today\./);
+      // Even after the goal, the hourly reminder keeps going.
+      const done = at(9);
+      expect(done.map((n) => new Date(n.at).getHours())).toEqual([12, 13, 14, 15, 16, 17, 18, 19, 20]);
+      expect(done[0].body).toBe('You’ve had 9 glasses today and reached your goal of 8. Keep sipping!');
+    });
+
+    it('doesn’t count toward the daily limit, and replaces the 3 pm water break', () => {
+      const y = addDays(today, -1);
+      const logs = { [y]: log(y, {}, { waterGlasses: 6 }), [today]: log(today, { cramps: 'severe', headache: 'migraine' }, { stress: 'high', waterGlasses: 1 }) };
+      const plan = planNotifications(input(make({ periodStart: '2026-09-20', water: true, logs }), t(today, 11)));
+      const main = plan.filter((p) => new Date(p.at).toDateString() === new Date(t(today, 12)).toDateString() && p.category !== 'reminders' && p.category !== 'water');
+      expect(main).toHaveLength(2);
+      expect(water(plan).length).toBeGreaterThan(5);
+      expect(plan.some((p) => p.key.startsWith('motivation/water-nudge'))).toBe(false);
+    });
+
+    it('can be switched off, and is on for people whose saved settings predate it', () => {
+      const off = make({ periodStart: '2026-09-20', water: false });
+      expect(water(planNotifications(input(off, t(today, 10))))).toHaveLength(0);
+      const legacy = make({ periodStart: '2026-09-20' });
+      const { water: _w, ...oldCategories } = DEFAULT_NOTIFICATION_SETTINGS.categories;
+      legacy.settings.notifications = { ...legacy.settings.notifications!, categories: oldCategories };
+      expect(water(planNotifications(input(legacy, t(today, 10)))).length).toBeGreaterThan(0);
+    });
+
+    it('forgets old water reminders from the sent list after two days', () => {
+      const now = t(today, 12);
+      const log2 = nextNotificationLog({ [`water/hourly:${addDays(today, -3)}T10`]: t(addDays(today, -3), 10), [`water/hourly:${today}T10`]: t(today, 10), [`comfort/stress:${addDays(today, -3)}`]: t(addDays(today, -3), 10) }, [], now);
+      expect(Object.keys(log2).sort()).toEqual([`comfort/stress:${addDays(today, -3)}`, `water/hourly:${today}T10`]);
+    });
+  });
+
+  describe('today’s win', () => {
+    const win = (logs: Record<string, DailyLog>, notif: Partial<NotificationSettings> = {}, now = t(today, 12)) =>
+      planNotifications(input(make({ periodStart: '2026-09-20', wins: true, logs, notif }), now)).find((n) => n.category === 'wins');
+    const y = addDays(today, -1);
+
+    it('is sent 30 minutes before quiet hours start, outside the daily limit', () => {
+      const w = win({ [today]: log(today, { cramps: 'severe', headache: 'migraine' }, { stress: 'high', workout: 'moderate' }) })!;
+      expect(w.at).toBe(t(today, 20, 30));
+      expect(w.title).toBe('Today’s win, Maya 🌟');
+      expect(win({ [today]: log(today, {}, { workout: 'light' }) }, { quietStart: 22 })!.at).toBe(t(today, 21, 30));
+    });
+
+    it('picks the one thing that stands out most', () => {
+      // Water goal beats everything else.
+      expect(win({ [today]: log(today, { moods: ['calm'] }, { waterGlasses: 9, workout: 'intense', sleepHours: 8, stress: 'low' }) })!.body).toBe(
+        'You drank 9 glasses of water and reached your goal. Your body thanks you 💧',
+      );
+      expect(win({ [today]: log(today, {}, { waterGlasses: 3, workout: 'moderate', sleepHours: 8 }) })!.body).toBe('You fit in a good workout today. That’s something to be proud of 💪');
+      expect(win({ [y]: log(y), [today]: log(today, {}, { sleepHours: 8.5 }) })!.body).toBe('You got 8½ hours of sleep last night. Rest like that makes everything a little easier 😴');
+      expect(win({ [today]: log(today, {}, { stress: 'low' }) })!.body).toMatch(/kept stress low/);
+      expect(win({ [today]: log(today, { moods: ['energetic'] }) })!.body).toBe('You felt energetic today. Hold on to that feeling ✨');
+      expect(win({ [today]: log(today, {}, { waterGlasses: 6 }) })!.body).toMatch(/so close to your goal of 8/);
+      expect(win({ [today]: log(today, { cramps: 'mild' }) })!.body).toMatch(/check in with yourself/);
+    });
+
+    it('isn’t sent on a day with nothing logged, and can be switched off', () => {
+      expect(win({})).toBeUndefined();
+      expect(win({ [today]: log(today, {}, { workout: 'light' }) }, { categories: { ...DEFAULT_NOTIFICATION_SETTINGS.categories, wins: false } })).toBeUndefined();
+    });
+
+    it('is still sent if Phase is opened after its time, but never in quiet hours', () => {
+      const logs = { [today]: log(today, {}, { workout: 'light' }) };
+      expect(win(logs, {}, t(today, 20, 45))!.at).toBe(t(today, 20, 46));
+      expect(win(logs, {}, t(today, 21, 15))).toBeUndefined();
+    });
+  });
+});
+
+describe('web delivery', () => {
+  it('shows due notifications as an in-app banner while open, and only then records them as sent', async () => {
+    const { vi } = await import('vitest');
+    vi.useFakeTimers();
+    (globalThis as { document?: unknown }).document = { visibilityState: 'visible' };
+    const notifier = await import('../lib/notifier');
+    const shown: string[] = [];
+    const recorded: string[] = [];
+    const off = notifier.onInAppMessage((m) => shown.push(m.title));
+    notifier.setOnShown((key) => recorded.push(key));
+
+    const now = Date.now();
+    await notifier.syncNotifications([
+      { key: 'comfort/a:1', category: 'comfort', at: now + 60_000, priority: 90, title: 'Sorry today’s rough 💛', body: 'x' },
+      { key: 'reminders/b:1', category: 'reminders', at: now + 3 * 3_600_000, priority: 40, title: 'How was today?', body: 'y' },
+    ]);
+    expect(recorded).toEqual([]); // nothing counts as sent until it's shown
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(shown).toEqual(['Sorry today’s rough 💛']);
+    expect(recorded).toEqual(['comfort/a:1']);
+
+    off();
+    notifier.setOnShown(null);
+    delete (globalThis as { document?: unknown }).document;
+    vi.useRealTimers();
+  });
+
+  it('catches up on same-day items when Phase is reopened later', () => {
+    const y = addDays(today, -1);
+    const data = make({ periodStart: '2026-09-20', logs: { [y]: log(y, {}, { waterGlasses: 6 }), [today]: log(today, {}, { waterGlasses: 1 }) } });
+    const opened = t(today, 16, 30); // after the 3 pm nudge time
+    const nudge = planNotifications(input(data, opened)).find((p) => p.key.startsWith('motivation/water-nudge'))!;
+    expect(nudge.at).toBe(opened + 60_000);
+  });
+});
